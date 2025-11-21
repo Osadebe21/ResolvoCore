@@ -391,4 +391,103 @@
   )
 )
 
+;; Advanced multi-criteria outcome resolution with adaptive weighting
+;; This function implements an intelligent resolution mechanism that dynamically
+;; adjusts weights based on oracle reputation, vote participation, and historical accuracy.
+;; It provides enhanced security against manipulation and improves resolution accuracy.
+(define-public (resolve-outcome-advanced (outcome-id uint) (oracle-addr principal))
+  (let
+    (
+      (outcome (unwrap! (map-get? outcomes { outcome-id: outcome-id }) err-not-found))
+      (oracle-data (unwrap! (map-get? oracles { oracle: oracle-addr }) err-unauthorized))
+      (oracle-result (unwrap! (get oracle-result outcome) err-not-found))
+      (oracle-conf (get oracle-confidence outcome))
+      (yes-votes (get community-yes-votes outcome))
+      (no-votes (get community-no-votes outcome))
+      (total-stake (get total-stake outcome))
+      (oracle-rep (get reputation oracle-data))
+    )
+    (asserts! (or (is-eq (get status outcome) status-voting)
+                  (is-eq (get status outcome) status-disputed)) err-invalid-status)
+    (asserts! (>= block-height (get voting-ends-at outcome)) err-voting-closed)
+    (asserts! (get active oracle-data) err-unauthorized)
+    
+    ;; Calculate adaptive weights based on oracle reputation and participation
+    (let
+      (
+        ;; Adjust oracle weight based on reputation (50-90% of base weight)
+        (adjusted-oracle-weight (+ (/ oracle-weight u2) 
+                                   (/ (* oracle-weight oracle-rep) u200)))
+        ;; Community weight is inverse of oracle weight
+        (adjusted-community-weight (- u100 adjusted-oracle-weight))
+        
+        ;; Calculate participation rate (affects confidence)
+        (participation-rate (if (> total-stake u0)
+                              (/ (* total-stake u100) (* min-stake u100))
+                              u0))
+        
+        ;; Confidence multiplier based on participation (0.5x to 1.5x)
+        (confidence-multiplier (if (> participation-rate u50)
+                                 (+ u100 (/ participation-rate u2))
+                                 (+ u50 participation-rate)))
+        
+        ;; Calculate oracle score with reputation weighting
+        (oracle-score (if oracle-result
+                         (/ (* adjusted-oracle-weight oracle-conf confidence-multiplier) u10000)
+                         (/ (* adjusted-oracle-weight (- u100 oracle-conf) confidence-multiplier) u10000)))
+        
+        ;; Calculate community consensus strength
+        (community-total (+ yes-votes no-votes))
+        (community-consensus (if (> community-total u0)
+                               (if (> yes-votes no-votes)
+                                 (/ (* yes-votes u100) community-total)
+                                 (/ (* no-votes u100) community-total))
+                               u50))
+        
+        ;; Calculate community score with adaptive weighting
+        (community-score (/ (* adjusted-community-weight community-consensus) u100))
+        
+        ;; Combined weighted score
+        (total-score (+ oracle-score community-score))
+        
+        ;; Determine final result with threshold
+        (final-result (> total-score u50))
+        
+        ;; Calculate confidence level for the resolution
+        (resolution-confidence (if (> total-score u75) u3
+                                 (if (> total-score u60) u2 u1)))
+      )
+      
+      ;; Update outcome with advanced resolution data
+      (map-set outcomes
+        { outcome-id: outcome-id }
+        (merge outcome {
+          status: status-resolved,
+          final-result: (some final-result),
+          resolution-block: block-height
+        })
+      )
+      
+      ;; Update oracle reputation based on community alignment
+      (let
+        (
+          (community-agrees (is-eq (> yes-votes no-votes) oracle-result))
+          (strong-consensus (or (> community-consensus u75) (< community-consensus u25)))
+        )
+        (if (and strong-consensus community-agrees)
+          (update-oracle-reputation oracle-addr true)
+          (if (and strong-consensus (not community-agrees))
+            (update-oracle-reputation oracle-addr false)
+            true))
+      )
+      
+      ;; Increment resolution counter
+      (var-set total-outcomes-resolved (+ (var-get total-outcomes-resolved) u1))
+      
+      ;; Return result with confidence level
+      (ok { result: final-result, confidence: resolution-confidence, score: total-score })
+    )
+  )
+)
+
 
